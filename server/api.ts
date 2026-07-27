@@ -27,6 +27,7 @@ const AUTHORIZED_REGISTRATIONS = [
   { email: "odunayo.ade@oasek.com", role: "WORKER", name: "Odunayo" },
   { email: "enitake@gmail.com", role: "WORKER", name: "Enitake" },
   { email: "francis.i@weapplying4u.com", role: "WORKER", name: "Francis" },
+  { email: "shina.tee@oasek.com", role: "WORKER", name: "Shina" },
   { email: "wunmi.oye@weapplying4u.com", role: "WORKER", name: "Omowunmi" },
 ];
 
