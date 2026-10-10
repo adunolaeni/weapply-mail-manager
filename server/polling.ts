@@ -1,4 +1,5 @@
 import dns from "dns";
+import { randomUUID } from "node:crypto";
 dns.setDefaultResultOrder("ipv4first");
 
 import { ImapFlow } from "imapflow";
@@ -143,6 +144,50 @@ function getGmailBody(payload: any): { html: string; text: string } {
   return { html, text };
 }
 
+// Message IDs are retained independently of the 30-minute email-content policy.
+// Insertion of the marker and email is atomic, so a failed insertion can be retried.
+async function storeIfNew(clientId: string, providerMessageId: string, email: {
+  sender: string; recipient: string; subject: string; bodyHtml: string;
+  bodyText: string; receivedISO: string; expiresAt: string;
+  otpCode: string | null; verificationLink: string | null;
+  classificationStatus: string; visibilityLevel: string;
+}): Promise<boolean> {
+  // Preserve existing rows when first deploying the tracking table.
+  const existing = await query(
+    `SELECT id FROM emails WHERE client_id = $1 AND sender = $2
+       AND recipient_email = $3 AND subject = $4 AND received_at = $5 LIMIT 1`,
+    [clientId, email.sender, email.recipient, email.subject, email.receivedISO]
+  );
+  if (existing.rows.length) {
+    await query(
+      `INSERT INTO synchronized_messages (client_id, provider_message_id)
+       VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [clientId, providerMessageId]
+    );
+    return false;
+  }
+
+  const result = await query(
+    `WITH new_message AS (
+       INSERT INTO synchronized_messages (client_id, provider_message_id)
+       VALUES ($1, $2) ON CONFLICT DO NOTHING
+       RETURNING client_id
+     )
+     INSERT INTO emails
+       (id, client_id, sender, recipient_email, subject, full_body_html,
+        full_body_text, otp_code, verification_link, received_at, expires_at,
+        classification_status, visibility_level)
+     SELECT $3, client_id, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+     FROM new_message RETURNING id`,
+    [clientId, providerMessageId, `email_${randomUUID()}`,
+     email.sender, email.recipient, email.subject, email.bodyHtml,
+     email.bodyText, email.otpCode, email.verificationLink,
+     email.receivedISO, email.expiresAt, email.classificationStatus,
+     email.visibilityLevel]
+  );
+  return (result.rowCount || 0) > 0;
+}
+
 // Fetch via Gmail API
 async function syncGmailClient(client: any) {
   let token = await refreshOAuthTokenIfNeeded(client);
@@ -150,10 +195,9 @@ async function syncGmailClient(client: any) {
     throw new Error("No access token available for Gmail OAuth synchronization.");
   }
 
-  // Get unread emails in the last 1 hour (including Spam folder)
-  // Query: newer_than:1h is:unread -is:trash
-  const qStr = encodeURIComponent("newer_than:1h is:unread -is:trash");
-  const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${qStr}&includeSpamTrash=true`;
+  // Search recent messages regardless of Gmail read status.
+  const qStr = encodeURIComponent("newer_than:1h -is:trash");
+  const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${qStr}&includeSpamTrash=true&maxResults=100`;
   
   let res = await fetch(listUrl, {
     headers: {
@@ -184,87 +228,55 @@ async function syncGmailClient(client: any) {
   }
 
   const listData = await res.json();
-  const messages = listData.messages || [];
+  let page = listData;
   let processedCount = 0;
 
-  for (const msgSummary of messages) {
-    const msgId = msgSummary.id;
+  // Follow Gmail pagination to avoid missing messages when volume is high.
+  while (page) {
+    for (const msgSummary of page.messages || []) {
+      const msgId = String(msgSummary.id);
+      const providerMessageId = `gmail:${msgId}`;
+      const alreadyTracked = await query(
+        `SELECT 1 FROM synchronized_messages WHERE client_id = $1 AND provider_message_id = $2`,
+        [client.id, providerMessageId]
+      );
+      if (alreadyTracked.rows.length) continue;
 
-    // Fetch message details
-    const msgRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msgId}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/json",
-      },
-    });
-
-    if (!msgRes.ok) continue;
-
-    const msg = await msgRes.json();
-    const headers = msg.payload?.headers || [];
-    
-    const subject = headers.find((h: any) => h.name?.toLowerCase() === "subject")?.value || "(No Subject)";
-    const sender = headers.find((h: any) => h.name?.toLowerCase() === "from")?.value || "Unknown Sender";
-    const recipient = headers.find((h: any) => h.name?.toLowerCase() === "to")?.value || client.email;
-    const dateStr = headers.find((h: any) => h.name?.toLowerCase() === "date")?.value;
-    
-    const receivedAt = dateStr ? new Date(dateStr) : new Date();
-    const receivedISO = receivedAt.toISOString();
-
-    // Prevent duplicate entries
-    const dupCheck = await query(
-      `SELECT id FROM emails 
-       WHERE sender = $1 AND recipient_email = $2 AND subject = $3 AND received_at = $4`,
-      [sender, recipient, subject, receivedISO]
-    );
-
-    if (dupCheck.rows.length > 0) {
-      continue; // Row already ingested in previous polls
+      // Gmail GET is read-only: do NOT call messages.modify or change UNREAD.
+      const msgRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(msgId)}?format=full`, {
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      });
+      if (!msgRes.ok) {
+        console.warn(`[Gmail] Could not fetch message ${msgId}: ${msgRes.status}`);
+        continue;
+      }
+      const msg = await msgRes.json();
+      const headers = msg.payload?.headers || [];
+      const subject = headers.find((h: any) => h.name?.toLowerCase() === "subject")?.value || "(No Subject)";
+      const sender = headers.find((h: any) => h.name?.toLowerCase() === "from")?.value || "Unknown Sender";
+      const recipient = headers.find((h: any) => h.name?.toLowerCase() === "to")?.value || client.email;
+      const dateStr = headers.find((h: any) => h.name?.toLowerCase() === "date")?.value;
+      const receivedAt = msg.internalDate ? new Date(Number(msg.internalDate)) : (dateStr ? new Date(dateStr) : new Date());
+      if (Number.isNaN(receivedAt.getTime())) continue;
+      const receivedISO = receivedAt.toISOString();
+      const expiresAt = new Date(receivedAt.getTime() + 30 * 60 * 1000).toISOString();
+      // Do not resurrect already-expired content on a later poll.
+      if (Date.parse(expiresAt) <= Date.now()) continue;
+      const bodyParts = getGmailBody(msg.payload);
+      const bodyHtml = bodyParts.html || bodyParts.text || "No HTML content";
+      const bodyText = bodyParts.text || bodyParts.html || "No plaintext content";
+      const extract = extractAuthArtifacts(subject, bodyText);
+      if (await storeIfNew(String(client.id), providerMessageId, {
+        sender, recipient, subject, bodyHtml, bodyText, receivedISO, expiresAt,
+        otpCode: extract.otp_code, verificationLink: extract.verification_link,
+        classificationStatus: extract.classification_status, visibilityLevel: extract.visibility_level,
+      })) processedCount++;
     }
-
-    const bodyParts = getGmailBody(msg.payload);
-    const bodyHtml = bodyParts.html || bodyParts.text || "No HTML content";
-    const bodyText = bodyParts.text || bodyParts.html || "No plaintext content";
-
-    // Run extraction logic
-    const extract = extractAuthArtifacts(subject, bodyText);
-
-    // ✅ CHANGE: Expiration changed from 60 minutes to 30 minutes
-    const expiresAt = new Date(receivedAt.getTime() + 30 * 60 * 1000).toISOString();
-
-    // Insert into db
-    await query(
-      `INSERT INTO emails (client_id, sender, recipient_email, subject, full_body_html, full_body_text, otp_code, verification_link, received_at, expires_at, classification_status, visibility_level)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-      [
-        client.id,
-        sender,
-        recipient,
-        subject,
-        bodyHtml,
-        bodyText,
-        extract.otp_code,
-        extract.verification_link,
-        receivedISO,
-        expiresAt,
-        extract.classification_status,
-        extract.visibility_level,
-      ]
-    );
-
-    // Modify Gmail message, mark as read (remove UNREAD label)
-    await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msgId}/modify`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        removeLabelIds: ["UNREAD"],
-      }),
-    });
-
-    processedCount++;
+    if (!page.nextPageToken) break;
+    const nextUrl = `${listUrl}&pageToken=${encodeURIComponent(page.nextPageToken)}`;
+    const nextRes = await fetch(nextUrl, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
+    if (!nextRes.ok) throw new Error(`Gmail pagination failed: ${nextRes.status}`);
+    page = await nextRes.json();
   }
 
   // Update client last synchronized stats
@@ -337,70 +349,41 @@ async function syncImapClient(client: any) {
     for (const folderPath of foldersToPoll) {
       let folderLock;
       try {
-        folderLock = await imapClient.getMailboxLock(folderPath);
+        folderLock = await imapClient.getMailboxLock(folderPath, { readOnly: true });
         
-        // Search unread messages in current folder
-        const searchResult = await imapClient.search({ seen: false });
+        // Search recent messages, not unread messages. UID remains stable within UIDVALIDITY.
+        const searchResult = await imapClient.search({ since: new Date(Date.now() - 60 * 60 * 1000) }, { uid: true });
+        const uidValidity = String(imapClient.mailbox && imapClient.mailbox.uidValidity ? imapClient.mailbox.uidValidity : "unknown");
         if (searchResult && Array.isArray(searchResult)) {
           for (const uid of searchResult) {
-            const fetchResult = await imapClient.fetchOne(uid, { source: true, envelope: true });
-            if (!fetchResult || !fetchResult.source) continue;
+            const providerMessageId = `imap:${folderPath}:${uidValidity}:${uid}`;
+            const alreadyTracked = await query(
+              `SELECT 1 FROM synchronized_messages WHERE client_id = $1 AND provider_message_id = $2`,
+              [client.id, providerMessageId]
+            );
+            if (alreadyTracked.rows.length) continue;
 
+            // Read-only mailbox plus PEEK-style source fetching leaves \Seen unchanged.
+            const fetchResult = await imapClient.fetchOne(uid, { source: true, envelope: true }, { uid: true });
+            if (!fetchResult || !fetchResult.source) continue;
             const parsed = await simpleParser(fetchResult.source);
-            
             const subject = parsed.subject || "(No Subject)";
             const senderObj = parsed.from?.value?.[0];
             const sender = senderObj ? `${senderObj.name || ""} <${senderObj.address || ""}>`.trim() : "Unknown Sender";
             const recipient = client.email;
-            const receivedAt = parsed.date
-             ? new Date(parsed.date)
-             : new Date();
+            const receivedAt = parsed.date ? new Date(parsed.date) : new Date();
+            if (Number.isNaN(receivedAt.getTime())) continue;
             const receivedISO = receivedAt.toISOString();
-
-            // Duplicate prevention
-            const dupCheck = await query(
-              `SELECT id FROM emails 
-               WHERE sender = $1 AND recipient_email = $2 AND subject = $3 AND received_at = $4`,
-              [sender, recipient, subject, receivedISO]
-            );
-
-            if (dupCheck.rows.length > 0) {
-              // Mark as seen so we don't fetch it next time even if we skip inserting it
-              await imapClient.messageFlagsAdd(uid, ["\\Seen"]);
-              continue;
-            }
-
-            const bodyHtml = parsed.html || parsed.text || "No HTML content";
-            const bodyText = parsed.text || parsed.html || "No plaintext content";
-
-            // Perform extraction
-            const extract = extractAuthArtifacts(subject, bodyText);
-            // ✅ CHANGE: Expiration changed from 60 minutes to 30 minutes
             const expiresAt = new Date(receivedAt.getTime() + 30 * 60 * 1000).toISOString();
-
-            // Insert
-            await query(
-              `INSERT INTO emails (client_id, sender, recipient_email, subject, full_body_html, full_body_text, otp_code, verification_link, received_at, expires_at, classification_status, visibility_level)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-              [
-                client.id,
-                sender,
-                recipient,
-                subject,
-                bodyHtml,
-                bodyText,
-                extract.otp_code,
-                extract.verification_link,
-                receivedISO,
-                expiresAt,
-                extract.classification_status,
-                extract.visibility_level,
-              ]
-            );
-
-            // Add \Seen flag to mark as read
-            await imapClient.messageFlagsAdd(uid, ["\\Seen"]);
-            processedCount++;
+            if (Date.parse(expiresAt) <= Date.now()) continue;
+            const bodyHtml = typeof parsed.html === "string" ? parsed.html : (parsed.text || "No HTML content");
+            const bodyText = parsed.text || (typeof parsed.html === "string" ? parsed.html : "No plaintext content");
+            const extract = extractAuthArtifacts(subject, bodyText);
+            if (await storeIfNew(String(client.id), providerMessageId, {
+              sender, recipient, subject, bodyHtml, bodyText, receivedISO, expiresAt,
+              otpCode: extract.otp_code, verificationLink: extract.verification_link,
+              classificationStatus: extract.classification_status, visibilityLevel: extract.visibility_level,
+            })) processedCount++;
           }
         }
       } catch (folderErr) {

@@ -121,6 +121,17 @@ export class DatabaseService {
         )
       `);
 
+      // Synchronization metadata is separate from short-lived email bodies.
+      // Stable provider IDs prevent refetching after 30-minute content deletion.
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS synchronized_messages (
+          client_id VARCHAR(100) NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+          provider_message_id TEXT NOT NULL,
+          synchronized_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (client_id, provider_message_id)
+        )
+      `);
+
       // 5. Create Audit Log
       await client.query(`
         CREATE TABLE IF NOT EXISTS audit_logs (
