@@ -4,6 +4,7 @@ import bcrypt from "bcryptjs";
 import { query, logAudit } from "./db.js";
 import { encrypt } from "./crypto.js";
 import { runPollingTick } from "./polling.js";
+import { registerMicrosoftMailboxRoutes } from "./microsoft.js";
 
 export const apiRouter = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || "default_jwt_secret_value_for_weapply4u_64_chars_long";
@@ -27,7 +28,6 @@ const AUTHORIZED_REGISTRATIONS = [
   { email: "odunayo.ade@oasek.com", role: "WORKER", name: "Odunayo" },
   { email: "enitake@gmail.com", role: "WORKER", name: "Enitake" },
   { email: "francis.i@weapplying4u.com", role: "WORKER", name: "Francis" },
-  { email: "shina.tee@oasek.com", role: "WORKER", name: "Shina" },
   { email: "wunmi.oye@weapplying4u.com", role: "WORKER", name: "Omowunmi" },
 ];
 
@@ -41,26 +41,6 @@ function serializeEmailRows(rows: any[]) {
       ? new Date(email.expires_at).toISOString()
       : null,
   }));
-}
-
-// Helper: returns the next available user id for a given prefix (e.g. "admin", "worker"),
-// sorting numerically on the suffix instead of lexicographically on the whole id string.
-// (Lexicographic sort caused collisions once a prefix reached 10+ rows, e.g. "worker_9"
-// sorting after "worker_10", which led to duplicate-id INSERTs and 500 errors on registration.)
-async function getNextUserId(prefix: string) {
-  const maxIdResult = await query(
-    `SELECT id FROM users WHERE id LIKE $1 ORDER BY CAST(SPLIT_PART(id, '_', 2) AS INTEGER) DESC LIMIT 1`,
-    [`${prefix}_%`]
-  );
-
-  let nextIdNum = 1;
-  if (maxIdResult.rows.length > 0) {
-    const lastId = maxIdResult.rows[0].id;
-    const lastNum = parseInt(lastId.split('_')[1], 10);
-    nextIdNum = lastNum + 1;
-  }
-
-  return `${prefix}_${nextIdNum}`;
 }
 
 // Helper middleware for JWT token verification
@@ -166,10 +146,19 @@ apiRouter.get("/oauth/google/callback", async (req, res) => {
     let user;
     if (existingUser.rows.length === 0) {
       const prefix = isAdmin ? "admin" : "worker";
-      const generatedId = await getNextUserId(prefix);
-
+      const maxIdResult = await query(`SELECT id FROM users WHERE id LIKE '${prefix}_%' ORDER BY id DESC LIMIT 1`);
+      let nextIdNum = 1;
+      
+      if (maxIdResult.rows.length > 0) {
+        const lastId = maxIdResult.rows[0].id;
+        const lastNum = parseInt(lastId.split('_')[1], 10);
+        nextIdNum = lastNum + 1;
+      }
+      
+      const generatedId = `${prefix}_${nextIdNum}`;
+      
       const result = await query(
-        `INSERT INTO users (id, name, email, password_hash, role, is_2fa_enabled)
+        `INSERT INTO users (id, name, email, password_hash, role, is_2fa_enabled) 
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
         [generatedId, name, email, "", role, false]
       );
@@ -211,7 +200,7 @@ apiRouter.get("/clients/oauth/callback", async (req, res) => {
   try {
     const decoded = Buffer.from(state as string, 'base64').toString('utf-8');
     const [userId, email] = decoded.split(':');
-
+    
     const userResult = await query("SELECT role FROM users WHERE id = $1 AND email = $2", [userId, email]);
     if (userResult.rows.length === 0 || userResult.rows[0].role !== 'ADMIN') {
       throw new Error("Invalid or non-admin user");
@@ -258,7 +247,7 @@ apiRouter.get("/clients/oauth/callback", async (req, res) => {
 
     if (existingClient.rows.length > 0) {
       await query(
-        `UPDATE clients
+        `UPDATE clients 
          SET oauth_access_token = $1, oauth_refresh_token = $2, oauth_token_expiry = $3, status = 'connected', last_synced_at = NOW()
          WHERE email = $4`,
         [accessToken, refreshToken, expiryTimestamp, email]
@@ -281,7 +270,7 @@ apiRouter.get("/clients/oauth/callback", async (req, res) => {
     res.redirect("/?oauth-client=error");
   }
 });
-
+    
 // Check if email is pre-authorized for registration
 apiRouter.post("/auth/check-pre-auth", async (req, res) => {
   const { email } = req.body;
@@ -320,7 +309,7 @@ apiRouter.post("/auth/check-pre-auth", async (req, res) => {
     return res.status(500).json({ error: "Server database verification error." });
   }
 });
-
+    
 // Register standard users (email/password users)
 apiRouter.post("/auth/register", async (req, res) => {
   const { name, email, password } = req.body;
@@ -350,15 +339,15 @@ apiRouter.post("/auth/register", async (req, res) => {
     if (checkUser.rows.length > 0) {
       // User exists (e.g. from seed or standard record). Let's update password and name
       await query(
-        `UPDATE users
+        `UPDATE users 
          SET name = $1, password_hash = $2, role = $3
          WHERE email = $4`,
         [finalName, hash, finalRole, normalizedEmail]
       );
-
+      
       const updatedUserRes = await query("SELECT id, name, email, role, is_2fa_enabled FROM users WHERE email = $1", [normalizedEmail]);
       registeredUser = updatedUserRes.rows[0];
-
+      
       await logAudit(
         normalizedEmail,
         finalRole,
@@ -368,10 +357,19 @@ apiRouter.post("/auth/register", async (req, res) => {
       );
     } else {
       // User does not exist, insert brand new user with ID matching the prefix
-      const generatedId = await getNextUserId(finalRole.toLowerCase());
-
+      const maxIdResult = await query(`SELECT id FROM users WHERE id LIKE '${finalRole.toLowerCase()}_%' ORDER BY id DESC LIMIT 1`);
+      let nextIdNum = 1;
+      
+      if (maxIdResult.rows.length > 0) {
+        const lastId = maxIdResult.rows[0].id;
+        const lastNum = parseInt(lastId.split('_')[1], 10);
+        nextIdNum = lastNum + 1;
+      }
+      
+      const generatedId = `${finalRole.toLowerCase()}_${nextIdNum}`;
+      
       const result = await query(
-        `INSERT INTO users (id, name, email, password_hash, role, is_2fa_enabled)
+        `INSERT INTO users (id, name, email, password_hash, role, is_2fa_enabled) 
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, email, role, is_2fa_enabled`,
         [generatedId, finalName, normalizedEmail, hash, finalRole, false]
       );
@@ -497,7 +495,7 @@ apiRouter.post("/clients/imap", authenticateToken, requireAdmin, async (req: any
 
     const result = await query(
       `INSERT INTO clients (client_name, email, provider, auth_type, imap_host, imap_port, encrypted_password, iv, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
        RETURNING id, client_name, email, provider, auth_type, imap_host, imap_port, status, connected_at`,
       [client_name, email, "google", "imap", imap_host, parseInt(imap_port, 10), encryptedText, iv, "connected"]
     );
@@ -544,6 +542,9 @@ apiRouter.get("/clients/oauth-link", authenticateToken, requireAdmin, (req: any,
 
   res.json({ url: authUrl });
 });
+
+// Separate Microsoft OAuth connection; existing Google/IMAP endpoints stay unchanged.
+registerMicrosoftMailboxRoutes(apiRouter, authenticateToken, requireAdmin);
 
 // Delete client inbox credential
 apiRouter.delete("/clients/:id", authenticateToken, requireAdmin, async (req: any, res) => {
@@ -645,8 +646,8 @@ apiRouter.post("/emails/:id/classify", authenticateToken, requireAdmin, async (r
     const emailItem = details.rows[0];
 
     await query(
-      `UPDATE emails
-       SET classification_status = $1, visibility_level = $2
+      `UPDATE emails 
+       SET classification_status = $1, visibility_level = $2 
        WHERE id = $3`,
       [classification_status, visibility_level, id]
     );

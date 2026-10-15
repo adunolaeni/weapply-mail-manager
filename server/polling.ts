@@ -7,6 +7,7 @@ import { simpleParser } from "mailparser";
 import { query, logAudit } from "./db.js";
 import { decrypt } from "./crypto.js";
 import { extractAuthArtifacts } from "./extraction.js";
+import { syncMicrosoftClient } from "./microsoft.js";
 
 // Keep track of exponential backoffs per client in milliseconds
 // backoff levels: 90s -> 180s -> 360s -> max 600s
@@ -353,7 +354,7 @@ async function syncImapClient(client: any) {
         
         // Search recent messages, not unread messages. UID remains stable within UIDVALIDITY.
         const searchResult = await imapClient.search({ since: new Date(Date.now() - 60 * 60 * 1000) }, { uid: true });
-        const uidValidity = String(imapClient.mailbox && imapClient.mailbox.uidValidity ? imapClient.mailbox.uidValidity : "unknown");
+        const uidValidity = String(imapClient.mailbox?.uidValidity ?? "unknown");
         if (searchResult && Array.isArray(searchResult)) {
           for (const uid of searchResult) {
             const providerMessageId = `imap:${folderPath}:${uidValidity}:${uid}`;
@@ -442,6 +443,8 @@ export async function runPollingTick() {
       try {
         if (client.auth_type === "oauth" && client.provider === "google") {
           await syncGmailClient(client);
+        } else if (client.auth_type === "oauth" && client.provider === "microsoft") {
+          await syncMicrosoftClient(client);
         } else if (client.auth_type === "imap") {
           await syncImapClient(client);
         }
