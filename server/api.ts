@@ -5,6 +5,7 @@ import { query, logAudit } from "./db.js";
 import { encrypt } from "./crypto.js";
 import { runPollingTick } from "./polling.js";
 import { registerMicrosoftMailboxRoutes } from "./microsoft.js";
+import { registerClientAuthorizationRoutes } from "./clientAuthorization.js";
 
 export const apiRouter = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || "default_jwt_secret_value_for_weapply4u_64_chars_long";
@@ -545,6 +546,7 @@ apiRouter.get("/clients/oauth-link", authenticateToken, requireAdmin, (req: any,
 
 // Separate Microsoft OAuth connection; existing Google/IMAP endpoints stay unchanged.
 registerMicrosoftMailboxRoutes(apiRouter, authenticateToken, requireAdmin);
+registerClientAuthorizationRoutes(apiRouter, authenticateToken, requireAdmin);
 
 // Delete client inbox credential
 apiRouter.delete("/clients/:id", authenticateToken, requireAdmin, async (req: any, res) => {

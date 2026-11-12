@@ -1,5 +1,5 @@
 import { useState, useEffect, FormEvent } from "react";
-import { Plus, Trash2, KeyRound, Globe, Wifi, AlertTriangle, Layers, Calendar, ChevronRight, Check, Mail } from "lucide-react";
+import { Plus, Trash2, KeyRound, Globe, Wifi, AlertTriangle, Layers, Calendar, ChevronRight, Check, Mail, Link2, Copy, Share2, XCircle, ShieldCheck } from "lucide-react";
 import { Client } from "../types";
 
 interface ClientManagerProps {
@@ -21,6 +21,100 @@ export default function ClientManager({ clients, loading, onRefresh, token }: Cl
   const [submitting, setSubmitting] = useState(false);
   const [oauthLoading, setOauthLoading] = useState(false);
   const [microsoftLoading, setMicrosoftLoading] = useState(false);
+  // Invitation creation is admin-only; existing mailbox tools are left unchanged.
+  const [showAuthorization, setShowAuthorization] = useState(false);
+  const [authorizationEnabled, setAuthorizationEnabled] = useState(false);
+  const [authClientName, setAuthClientName] = useState("");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authProvider, setAuthProvider] = useState<"google" | "microsoft">("google");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [generatedLink, setGeneratedLink] = useState("");
+  const [authNotice, setAuthNotice] = useState("");
+  const [invitations, setInvitations] = useState<Array<{
+    id: string; client_name: string; email: string; provider: string;
+    status: string; expires_at: string; completed_at: string | null; mailbox_status: string | null;
+  }>>([]);
+  const [authListError, setAuthListError] = useState("");
+
+  const loadInvitations = async () => {
+    try {
+      const response = await fetch("/api/client-authorization/invitations", {
+        headers: {Authorization: `Bearer ${token}`}, cache: "no-store",
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "Unable to load requests.");
+      setInvitations(payload);
+      setAuthListError("");
+    } catch (err: any) { setAuthListError(err?.message || "Couldn't load invitation history."); }
+  };
+
+  useEffect(() => {
+    let active = true;
+    fetch("/api/client-authorization/feature", {
+      headers: {Authorization: `Bearer ${token}`}, cache: "no-store",
+    }).then(r => r.ok ? r.json() : {enabled: false})
+      .then(data => {if (active) setAuthorizationEnabled(data.enabled === true);})
+      .catch(() => {if (active) setAuthorizationEnabled(false);});
+    return () => {active = false;};
+  }, [token]);
+
+  useEffect(() => {
+    if (authorizationEnabled) void loadInvitations();
+  }, [token, authorizationEnabled]);
+
+  const createInvitation = async (e: FormEvent) => {
+    e.preventDefault();
+    setAuthError("");
+    setAuthNotice("");
+    setGeneratedLink("");
+    setAuthBusy(true);
+    try {
+      const response = await fetch("/api/client-authorization/invitations", {
+        method: "POST",
+        headers: {"Content-Type": "application/json", Authorization: `Bearer ${token}`},
+        body: JSON.stringify({client_name: authClientName, email: authEmail, provider: authProvider}),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "Unable to create a connection link.");
+      setGeneratedLink(payload.link);
+      setAuthNotice("Link created. Copy and send it privately to the intended client.");
+      await loadInvitations();
+    } catch (err: any) { setAuthError(err?.message || "Could not generate invitation."); }
+    finally { setAuthBusy(false); }
+  };
+
+  const copyInvitation = async () => {
+    try {
+      await navigator.clipboard.writeText(generatedLink);
+      setAuthNotice("Link copied. Send it privately via WhatsApp or email.");
+    } catch { setAuthNotice("Copy the link from the field below if clipboard access is blocked."); }
+  };
+
+  const shareInvitation = async () => {
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: "WeApplying4U – Connect your email",
+          text: "Please authorize your email using this private, 24-hour link. Never share your password or passkey with staff.",
+          url: generatedLink,
+        });
+      } catch { /* User cancelled sharing. */ }
+    } else { await copyInvitation(); }
+  };
+
+  const revokeInvitation = async (id: string) => {
+    if (!window.confirm("Cancel this unused invitation? The client will need a new link.")) return;
+    setAuthError("");
+    try {
+      const response = await fetch(`/api/client-authorization/invitations/${encodeURIComponent(id)}/revoke`, {
+        method: "POST", headers: {Authorization: `Bearer ${token}`},
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "Unable to revoke invitation.");
+      await loadInvitations();
+    } catch (err: any) {setAuthError(err?.message || "Unable to revoke invitation.");}
+  };
 
   // ✅ Auto-fill IMAP settings based on provider selection
   useEffect(() => {
@@ -165,6 +259,14 @@ export default function ClientManager({ clients, loading, onRefresh, token }: Cl
             <span>{microsoftLoading ? "Redirecting..." : "Connect Hotmail / Outlook"}</span>
           </button>
 
+          {authorizationEnabled && <button
+            type="button" onClick={() => setShowAuthorization(v => !v)}
+            className="inline-flex items-center space-x-1.5 px-3.5 py-2 text-xs font-bold rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white transition-all cursor-pointer shadow-sm"
+          >
+            <Link2 className="h-3.5 w-3.5" />
+            <span>Authorize Client Email</span>
+          </button>}
+
           {/* IMAP toggle button */}
           <button
             id="imap-form-toggle-btn"
@@ -182,6 +284,83 @@ export default function ClientManager({ clients, loading, onRefresh, token }: Cl
           <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
           <span>Error details: {error}</span>
         </div>
+      )}
+
+      {/* Self-service authorization: existing mailbox connection forms stay untouched. */}
+      {authorizationEnabled && showAuthorization && (
+        <section className="bg-white dark:bg-slate-900 rounded-2xl border border-emerald-200 dark:border-slate-700 p-5 space-y-5 shadow-sm" aria-label="Client email authorization">
+          <div className="flex items-center gap-2">
+            <ShieldCheck className="h-5 w-5 text-emerald-700 dark:text-emerald-400"/>
+            <div>
+              <h3 className="font-bold text-sm text-slate-900 dark:text-white">Secure client email authorization</h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400">One email address per link. Clients connect on their own devices without staff passwords.</p>
+            </div>
+          </div>
+          <form onSubmit={createInvitation} className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <label className="text-xs text-slate-600 dark:text-slate-300 space-y-1">
+              <span className="font-semibold block">Client's name</span>
+              <input required maxLength={150} value={authClientName} onChange={e => setAuthClientName(e.target.value)} placeholder="Client's full name"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-slate-900 dark:text-white"/>
+            </label>
+            <label className="text-xs text-slate-600 dark:text-slate-300 space-y-1">
+              <span className="font-semibold block">Exact email to authorize</span>
+              <input required type="email" maxLength={254} value={authEmail} onChange={e => setAuthEmail(e.target.value)} placeholder="client@gmail.com"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-slate-900 dark:text-white"/>
+            </label>
+            <label className="text-xs text-slate-600 dark:text-slate-300 space-y-1">
+              <span className="font-semibold block">Email provider</span>
+              <select value={authProvider} onChange={e => setAuthProvider(e.target.value as "google" | "microsoft")}
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-slate-900 dark:text-white">
+                <option value="google">Google / Gmail</option>
+                <option value="microsoft">Microsoft / Hotmail / Outlook</option>
+              </select>
+            </label>
+            <div className="flex items-end">
+              <button type="submit" disabled={authBusy} className="w-full py-2 px-4 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold disabled:opacity-50">
+                {authBusy ? "Generating…" : "Generate 24-hour link"}
+              </button>
+            </div>
+          </form>
+          {authError && <p role="alert" className="text-xs text-red-700 bg-red-50 p-3 rounded-lg">{authError}</p>}
+          {generatedLink && (
+            <div className="bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 p-4 rounded-xl space-y-2">
+              <p className="text-xs font-bold text-emerald-800 dark:text-emerald-200">Your private client link is ready — copy it now</p>
+              <input readOnly aria-label="Generated authorization link" value={generatedLink} onFocus={e => e.currentTarget.select()}
+                className="w-full text-xs rounded-lg p-2 border border-emerald-200 bg-white text-slate-800" />
+              <div className="flex gap-2 flex-wrap">
+                <button type="button" onClick={copyInvitation} className="inline-flex items-center gap-2 rounded-lg bg-emerald-700 text-white px-3 py-2 text-xs font-semibold"><Copy className="w-3.5 h-3.5"/> Copy link</button>
+                <button type="button" onClick={shareInvitation} className="inline-flex items-center gap-2 rounded-lg border border-emerald-300 text-emerald-800 dark:text-emerald-200 px-3 py-2 text-xs font-semibold"><Share2 className="w-3.5 h-3.5"/> Share</button>
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">The original link is shown only now. If lost, generate a new one. Do not post links publicly.</p>
+            </div>
+          )}
+          {authNotice && <p role="status" className="text-xs text-emerald-700 dark:text-emerald-300">{authNotice}</p>}
+          <div className="border-t border-slate-200 dark:border-slate-700 pt-3 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <h4 className="text-xs font-bold text-slate-800 dark:text-white">Recent authorization requests</h4>
+              <button type="button" onClick={() => {void loadInvitations(); onRefresh();}} className="text-xs text-indigo-700 dark:text-indigo-300 hover:underline">Refresh statuses</button>
+            </div>
+            {authListError && <p className="text-xs text-amber-700">{authListError}</p>}
+            {invitations.length === 0 && <p className="text-xs text-slate-500">No invitations created yet.</p>}
+            <div className="space-y-2 max-h-80 overflow-y-auto">
+              {invitations.map(inv => {
+                const status = inv.status === "pending" && new Date(inv.expires_at).getTime() <= Date.now() ? "expired" : inv.status;
+                return (
+                  <div key={inv.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-50 dark:bg-slate-800/60 p-3 border border-slate-100 dark:border-slate-700">
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-slate-900 dark:text-white break-all">{inv.client_name} — {inv.email}</p>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400">{inv.provider === "google" ? "Gmail" : "Hotmail / Outlook"} · {status === "pending" ? `Expires ${new Date(inv.expires_at).toLocaleString()}` : status}{status === "connected" && inv.mailbox_status ? ` · Mailbox: ${inv.mailbox_status}` : ""}</p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className={`text-[10px] font-bold uppercase ${status === "connected" ? "text-emerald-700" : status === "pending" ? "text-amber-700" : "text-slate-500"}`}>{status}</span>
+                      {status === "pending" && <button title="Revoke invitation" onClick={() => {void revokeInvitation(inv.id);}} className="text-slate-500 hover:text-red-700"><XCircle className="h-4 w-4"/></button>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </section>
       )}
 
       {/* Manual IMAP Setup Panel Form */}

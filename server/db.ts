@@ -132,6 +132,42 @@ export class DatabaseService {
         )
       `);
 
+      // Self-service client authorization is additive. Failure must not take down login/polling.
+      try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS client_authorization_invites (
+          id UUID PRIMARY KEY,
+          token_hash CHAR(64) UNIQUE NOT NULL,
+          client_name VARCHAR(150) NOT NULL,
+          assigned_email VARCHAR(254) NOT NULL,
+          provider VARCHAR(20) NOT NULL CHECK (provider IN ('google', 'microsoft')),
+          existing_client_id VARCHAR(100) NULL REFERENCES clients(id) ON DELETE SET NULL,
+          created_by VARCHAR(100) NOT NULL,
+          status VARCHAR(20) NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending', 'connected', 'revoked')),
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          expires_at TIMESTAMPTZ NOT NULL,
+          completed_at TIMESTAMPTZ NULL,
+          consented_at TIMESTAMPTZ NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          oauth_state_hash CHAR(64) NULL,
+          code_verifier TEXT NULL,
+          attempt_expires_at TIMESTAMPTZ NULL
+        )
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_client_auth_invites_created
+        ON client_authorization_invites (created_at DESC)
+      `);
+      await client.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_client_auth_oauth_state
+        ON client_authorization_invites (oauth_state_hash)
+        WHERE oauth_state_hash IS NOT NULL
+      `);
+      } catch (invitationSchemaError: any) {
+        console.error("[ClientAuthorization] Invitation table could not be initialized:", invitationSchemaError?.message);
+      }
+
       // 5. Create Audit Log
       await client.query(`
         CREATE TABLE IF NOT EXISTS audit_logs (
@@ -227,6 +263,21 @@ export class DatabaseService {
     }
   }
 
+  async withTransaction<T>(work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+    const client = await this.pool!.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await work(client);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   // --- DATABASE HELPERS ---
 
   async query(sql: string, params?: any[]) {
@@ -297,4 +348,8 @@ export async function logAudit(
     status,
     ip_address: ipAddress || null
   });
+}
+/** Use one PostgreSQL transaction for mailbox token persistence + invitation completion. */
+export async function withTransaction<T>(work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  return db.withTransaction(work);
 }

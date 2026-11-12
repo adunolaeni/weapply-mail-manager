@@ -354,7 +354,7 @@ async function syncImapClient(client: any) {
         
         // Search recent messages, not unread messages. UID remains stable within UIDVALIDITY.
         const searchResult = await imapClient.search({ since: new Date(Date.now() - 60 * 60 * 1000) }, { uid: true });
-        const uidValidity = String(imapClient.mailbox?.uidValidity ?? "unknown");
+        const uidValidity = String(imapClient.mailbox ? imapClient.mailbox.uidValidity : "unknown");
         if (searchResult && Array.isArray(searchResult)) {
           for (const uid of searchResult) {
             const providerMessageId = `imap:${folderPath}:${uidValidity}:${uid}`;
